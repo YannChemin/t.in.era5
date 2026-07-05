@@ -378,8 +378,15 @@ def write_geotiff(path, array, lons, lats, nodata=-9999.0):
     arr = np.array(array, dtype=np.float32)
     arr = np.where(np.isnan(arr) | (np.abs(arr) > 1.0e30), nodata, arr)
     band = dst.GetRasterBand(1)
-    band.WriteArray(arr)
+    # SetNoDataValue() must come *before* WriteArray(): calling it
+    # after silently re-fills any not-yet-flushed blocks with the
+    # nodata value, overwriting real data already written -- confirmed
+    # by direct reproduction with a plain all-zero array (a real,
+    # legitimate value for a dry day) coming back as all-nodata after
+    # round-tripping through a fresh gdal.Open(), only when
+    # SetNoDataValue() ran after WriteArray().
     band.SetNoDataValue(nodata)
+    band.WriteArray(arr)
     dst.FlushCache()
     dst = None
 
