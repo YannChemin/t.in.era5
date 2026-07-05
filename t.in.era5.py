@@ -314,7 +314,28 @@ def load_daily(path, var_info, source):
     time_dim = "valid_time" if "valid_time" in da.dims else "time"
 
     if source == "era5land" and var_info["accumulated"]:
-        da = da.resample({time_dim: "1D"}).sum()
+        # reanalysis-era5-land's raw hourly accumulated fields are NOT
+        # hour-differenced increments -- confirmed by inspection: each
+        # field resets near zero at hour 01 UTC and climbs
+        # monotonically to a peak at hour 00 UTC the *following* day,
+        # then resets again. That peak *is* the day's total (the whole
+        # cycle's accumulation); summing all 24 raw hourly readings
+        # (as before) adds up already-cumulative numbers on top of each
+        # other and wildly overcounts (confirmed: one single day
+        # inflated to ~230mm regional mean this way, versus a plausible
+        # ~0.03-3mm/day for the same real values). Shifting every
+        # timestamp back 1 hour realigns each 01h..00h(+1) cycle onto a
+        # single calendar day, so grouping by day and taking the last
+        # (i.e. peak) value per group recovers the correct daily total.
+        # Edge effect: the last calendar day of a given fetched month
+        # is missing its final (hour-00-of-next-month) reading, since
+        # month chunks don't fetch across their own boundary -- that
+        # day's total is undercounted by about one hour's worth of
+        # accumulation, not the full day.
+        shifted = da.assign_coords(
+            {time_dim: da[time_dim] - np.timedelta64(1, "h")}
+        )
+        da = shifted.resample({time_dim: "1D"}).last()
 
     lats = da["latitude"].values
     lons = da["longitude"].values
