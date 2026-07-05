@@ -17,9 +17,8 @@
 #               year, month) so a fallback only affects the affected
 #               chunk, and so repeat runs can reuse a local cache
 #               instead of re-downloading.
-# COPYRIGHT:    (C) 2026 by Yann Chemin, and the GRASS Development Team
-#               This program is free software under the GNU General
-#               Public License (>=v2).
+# COPYRIGHT:    (C) 2026 by Yann Chemin
+#               Released into the public domain -- see LICENSE (Unlicense).
 #
 ############################################################################
 
