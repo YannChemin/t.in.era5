@@ -1,0 +1,96 @@
+<h2>DESCRIPTION</h2>
+
+<em>t.in.era5</em> downloads one or more daily climate variables from
+the Copernicus Climate Data Store (CDS) and imports each as its own
+STRDS (<tt>&lt;output_prefix&gt;_&lt;variable&gt;</tt>), ready to feed
+<a href="r.hydro.hbv.forcing.html">r.hydro.hbv.forcing</a> (which
+reduces a STRDS to a per-basin table for
+<a href="r.hydro.hbv.html">r.hydro.hbv</a>), or any other temporal
+GRASS workflow.
+
+<p>
+For each variable, <b>ERA5-Land</b> (~9km grid, generally preferable for
+land applications) is tried first; if that fails for a given month
+(explicit CDS error, network issue, or a genuine coverage gap), the
+module automatically falls back to <b>ERA5</b> (~31km grid, longer
+historical record) for that month only -- other months/variables are
+unaffected. One CDS quirk drives part of this fallback even when
+ERA5-Land data actually exists: the
+<tt>derived-era5-land-daily-statistics</tt> product used for
+"instantaneous" variables (temperature, wind, pressure, ...) explicitly
+refuses to compute daily statistics for <em>accumulated</em> variables
+(precipitation, potential evaporation, solar radiation, snowfall). For
+those, <em>t.in.era5</em> requests raw hourly
+<tt>reanalysis-era5-land</tt> data instead and sums it to a daily total
+itself -- still ERA5-Land, just via a different CDS product -- before
+falling back to ERA5's own (accumulation-capable) daily-statistics
+product only if that also fails.
+
+<p>
+Requests are chunked per (variable, year, month), so a single failure
+doesn't force re-fetching a whole multi-year request, and repeat runs
+against the same <b>cache_dir</b> reuse already-downloaded months
+instead of re-downloading them.
+
+<h2>VARIABLES</h2>
+
+<table>
+<tr><th>key</th><th>CDS variable</th><th>native units</th><th>converted to</th></tr>
+<tr><td><tt>precipitation</tt></td><td>total_precipitation</td><td>m/day (accum.)</td><td>mm/d</td></tr>
+<tr><td><tt>temperature</tt></td><td>2m_temperature (daily mean)</td><td>K</td><td>deg C</td></tr>
+<tr><td><tt>temperature_min</tt></td><td>2m_temperature (daily min)</td><td>K</td><td>deg C</td></tr>
+<tr><td><tt>temperature_max</tt></td><td>2m_temperature (daily max)</td><td>K</td><td>deg C</td></tr>
+<tr><td><tt>dewpoint_temperature</tt></td><td>2m_dewpoint_temperature</td><td>K</td><td>deg C</td></tr>
+<tr><td><tt>potential_evaporation</tt></td><td>potential_evaporation</td><td>m/day (accum.)</td><td>mm/d</td></tr>
+<tr><td><tt>solar_radiation</tt></td><td>surface_solar_radiation_downwards</td><td>J/m2 (accum.)</td><td>MJ/m2/d</td></tr>
+<tr><td><tt>wind_u</tt></td><td>10m_u_component_of_wind</td><td>m/s</td><td>m/s</td></tr>
+<tr><td><tt>wind_v</tt></td><td>10m_v_component_of_wind</td><td>m/s</td><td>m/s</td></tr>
+<tr><td><tt>surface_pressure</tt></td><td>surface_pressure</td><td>Pa</td><td>kPa</td></tr>
+<tr><td><tt>snowfall</tt></td><td>snowfall</td><td>m (accum.)</td><td>mm/d</td></tr>
+</table>
+
+<h2>CDS ACCOUNT SETUP</h2>
+
+<em>t.in.era5</em> uses the <tt>cdsapi</tt> Python package, which reads
+credentials from <tt>~/.cdsapirc</tt>. Create a free account at
+<a href="https://cds.climate.copernicus.eu">https://cds.climate.copernicus.eu</a>,
+accept the ERA5/ERA5-Land dataset licences on the CDS website (one-time,
+per dataset), then copy your personal access token from your CDS
+profile page into <tt>~/.cdsapirc</tt>:
+
+<div class="code"><pre>
+url: https://cds.climate.copernicus.eu/api
+key: &lt;your-personal-access-token&gt;
+</pre></div>
+
+(the <tt>url</tt>/<tt>key</tt> values above are the real format this
+file takes -- only the token itself is account-specific). Without this
+file (or with an invalid token), every CDS request <em>t.in.era5</em>
+makes will fail immediately with an authentication error.
+
+<h2>EXAMPLE</h2>
+
+<div class="code"><pre>
+g.region n=34 s=31 e=49 w=47 res=0:06 # ~0.1 deg, matches ERA5-Land's native grid
+
+t.in.era5 variables=precipitation,temperature,potential_evaporation \
+  start=2001-06-01 end=2001-08-31 \
+  output_prefix=karkheh cache_dir=$HOME/era5_cache
+
+r.hydro.hbv.forcing strds=karkheh_precipitation basins=basins \
+  basins_vector=basins_v output_table=karkheh_precip_table
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="r.hydro.hbv.html">r.hydro.hbv</a>,
+<a href="r.hydro.hbv.forcing.html">r.hydro.hbv.forcing</a>,
+<a href="t.create.html">t.create</a>,
+<a href="t.register.html">t.register</a>,
+<a href="r.import.html">r.import</a>
+</em>
+
+<h2>AUTHOR</h2>
+
+Yann Chemin
