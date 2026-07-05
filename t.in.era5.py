@@ -336,6 +336,15 @@ def load_daily(path, var_info, source):
             {time_dim: da[time_dim] - np.timedelta64(1, "h")}
         )
         da = shifted.resample({time_dim: "1D"}).last()
+        # the first group is always a spurious single leftover hour
+        # (raw hour 00:00 on day 1 of this month's own file, shifted
+        # to 23:00 the day before -- the tail end of the *previous*
+        # month's cycle, not a real day here): for a month in the
+        # middle of a multi-month request this exact date was already
+        # correctly computed from the previous month's own file, so
+        # keeping it here would register the same date twice and crash
+        # t.register with a UNIQUE constraint violation.
+        da = da.isel({time_dim: slice(1, None)})
 
     lats = da["latitude"].values
     lons = da["longitude"].values
