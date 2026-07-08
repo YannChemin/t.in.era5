@@ -102,6 +102,11 @@ def cleanup():
         shutil.rmtree(TMP_DIR, ignore_errors=True)
 
 
+# Nominal native grid spacing in degrees, used as a write_geotiff()
+# fallback when a requested area is smaller than one grid cell (CDS then
+# returns a single point along that axis, with nothing to diff against).
+NATIVE_RESOLUTION_DEG = {"era5land": 0.1, "era5": 0.25}
+
 # variable key -> CDS variable name (same name used for both ERA5-Land and
 # ERA5), whether it's an accumulated (flux/depth-since-last-step) field
 # (which the "derived ... daily-statistics" products refuse to compute
@@ -359,11 +364,23 @@ def load_daily(path, var_info, source):
     return dates, values, lats, lons
 
 
-def write_geotiff(path, array, lons, lats, nodata=-9999.0):
+def write_geotiff(path, array, lons, lats, nodata=-9999.0, fallback_res_deg=None):
     from osgeo import gdal, osr
 
-    dx = float(lons[1] - lons[0])
-    dy = float(lats[1] - lats[0])
+    # A requested area smaller than the product's native grid spacing
+    # (e.g. a few-km field against ERA5-Land's ~0.1 deg / ERA5's ~0.25
+    # deg grid) makes CDS return a single point along that axis, so
+    # there's no second point to diff. Fall back to the product's
+    # nominal grid step: lon ascending (+), lat descending (-),
+    # matching the ordering CDS returns for >1 point.
+    if len(lons) > 1:
+        dx = float(lons[1] - lons[0])
+    else:
+        dx = fallback_res_deg if fallback_res_deg else 0.1
+    if len(lats) > 1:
+        dy = float(lats[1] - lats[0])
+    else:
+        dy = -(fallback_res_deg if fallback_res_deg else 0.1)
     origin_x = float(lons[0]) - dx / 2.0
     origin_y = float(lats[0]) - dy / 2.0
 
