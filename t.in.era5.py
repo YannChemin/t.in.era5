@@ -481,11 +481,15 @@ def main():
             overwrite=True,
         )
 
+        fallback_res_deg = NATIVE_RESOLUTION_DEG[
+            "era5land" if "era5land" in sources_used else "era5"
+        ]
+
         raster_names = []
         for d, v in zip(all_dates, all_values):
             base = "%s_%s" % (strds, d.strftime("%Y%m%d"))
             tif = os.path.join(cache_dir, base + ".tif")
-            write_geotiff(tif, v, lons, lats)
+            write_geotiff(tif, v, lons, lats, fallback_res_deg=fallback_res_deg)
             gs.run_command(
                 "r.import", input=tif, output=base, overwrite=True, quiet=True
             )
