@@ -1,8 +1,8 @@
 <h2>DESCRIPTION</h2>
 
-<em>t.in.era5</em> downloads one or more daily climate variables from
-the Copernicus Climate Data Store (CDS) and imports each as its own
-STRDS (<tt>&lt;output_prefix&gt;_&lt;variable&gt;</tt>), ready to feed
+<em>t.in.era5</em> downloads one or more daily climate variables and
+imports each as its own STRDS
+(<tt>&lt;output_prefix&gt;_&lt;variable&gt;</tt>), ready to feed
 <a href="r.hydro.hbv.forcing.html">r.hydro.hbv.forcing</a> (which
 reduces a STRDS to a per-basin table for
 <a href="r.hydro.hbv.html">r.hydro.hbv</a>), or any other temporal
@@ -10,11 +10,19 @@ GRASS workflow.
 
 <p>
 For each variable, <b>ERA5-Land</b> (~9km grid, generally preferable for
-land applications) is tried first; if that fails for a given month
-(explicit CDS error, network issue, or a genuine coverage gap), the
-module automatically falls back to <b>ERA5</b> (~31km grid, longer
-historical record) for that month only -- other months/variables are
-unaffected. One CDS quirk drives part of this fallback even when
+land applications) is tried first via the Copernicus Climate Data Store
+(CDS); if that fails for a given month (explicit CDS error, no
+<tt>~/.cdsapirc</tt> configured, network issue, or a genuine coverage
+gap), the module automatically falls back to <b>plain ERA5</b> (~31km
+grid, longer historical record) for that month only -- other months/
+variables are unaffected. By default that fallback tier is read
+straight from the public
+<a href="#arco-era5-google-cloud-source">ARCO-ERA5</a> Google Cloud
+archive (no CDS account needed at all for it); pass <b>-c</b> to use
+CDS's own plain-ERA5 product there instead.
+
+<p>
+One CDS quirk drives part of the ERA5-Land fallback even when
 ERA5-Land data actually exists: the
 <tt>derived-era5-land-daily-statistics</tt> product used for
 "instantaneous" variables (temperature, wind, pressure, ...) explicitly
@@ -23,14 +31,179 @@ refuses to compute daily statistics for <em>accumulated</em> variables
 those, <em>t.in.era5</em> requests raw hourly
 <tt>reanalysis-era5-land</tt> data instead and sums it to a daily total
 itself -- still ERA5-Land, just via a different CDS product -- before
-falling back to ERA5's own (accumulation-capable) daily-statistics
-product only if that also fails.
+falling back to the plain-ERA5 tier only if that also fails.
 
 <p>
 Requests are chunked per (variable, year, month), so a single failure
 doesn't force re-fetching a whole multi-year request, and repeat runs
 against the same <b>cache_dir</b> reuse already-downloaded months
 instead of re-downloading them.
+
+<h2><a name="arco-era5-google-cloud-source"></a>ARCO-ERA5 (Google Cloud) SOURCE</h2>
+
+By default, the plain-ERA5 fallback tier is read directly from
+<a href="https://github.com/google-research/arco-era5">ARCO-ERA5</a>, a
+public, anonymous-access Zarr mirror of ERA5 on Google Cloud Storage
+(<tt>gs://gcp-public-data-arco-era5</tt>), via
+<tt>xarray</tt>/<tt>zarr</tt>/<tt>gcsfs</tt> instead of a CDS request.
+This needs no CDS account for that tier and sidesteps the CDS download
+queue entirely, but ARCO-ERA5 only ever provides plain ERA5 (~31km
+grid) -- it has no ERA5-Land counterpart. ERA5-Land is still tried
+first via CDS unless <b>-e</b> is also given; <b>-e</b> alone (without
+<b>-c</b>) means <em>t.in.era5</em> never contacts CDS at all, needing
+no CDS account whatsoever. Pass <b>-c</b> to use CDS's own plain-ERA5
+product for that tier instead (needs <tt>~/.cdsapirc</tt>).
+
+<p>
+<em>t.in.era5</em> opens the store with
+<tt>xarray.open_zarr(..., chunks=None, storage_options=dict(token="anon"))</tt>
+-- matching
+<a href="https://github.com/google-research/arco-era5">Google's own
+arco-era5 usage examples</a> for this exact dataset, and confirmed in
+practice to be both simpler (no <tt>dask</tt> dependency at all) and
+faster than <tt>chunks="auto"</tt>, which only adds a dask-array layer
+that regroups the store's own chunks without reducing what gets
+transferred.
+
+<p>
+ARCO-ERA5 is an unmodified GRIB-to-Zarr conversion of the raw archive,
+so accumulated variables (precipitation, potential evaporation, solar
+radiation, snowfall) are still in ECMWF's raw forecast-accumulation
+form and are de-accumulated locally to daily totals, following ECMWF's
+published conversion guidance for these fields. This is a different
+correction than the one applied to ERA5-Land's raw hourly data (see
+above) -- do not assume the two behave the same way.
+
+<p>
+Reading ARCO-ERA5 requires the <tt>gcsfs</tt> and <tt>zarr</tt> Python
+packages in addition to <tt>xarray</tt>/<tt>netCDF4</tt>.
+<tt>make venv</tt> (see the Makefile) builds a dedicated virtualenv
+with all of these under the installed addon's own
+<tt>etc/t.in.era5/venv</tt>, which <em>t.in.era5.py</em> detects and
+uses automatically -- no manual <tt>pip install</tt> needed, and none
+is attempted against GRASS's own Python installation (which a plain
+<tt>pip install</tt> often can't touch anyway, blocked by PEP 668's
+externally-managed-environment guard on modern Debian/Ubuntu).
+
+<h3>Cost/performance: whole-globe-per-hour chunking, and the world cache</h3>
+
+Per arco-era5's own README, the
+<tt>ar/full_37-1h-0p25deg-chunk-1.zarr-v3</tt> array this module reads
+is chunked <tt>{"time": 1, "latitude": 721, "longitude": 1440}</tt> --
+<b>one Zarr chunk per hour, spanning the entire globe</b> (confirmed
+directly against the store's chunk metadata: ~4.15 MB uncompressed,
+~1.7-1.9 MB compressed per hourly chunk for a 2D surface field). There
+is no bounding box small enough to avoid downloading and decompressing
+that whole-globe chunk for every hour touched -- <b>area</b> only trims
+what's <em>kept</em> after each hourly chunk is already in memory, not
+what gets <em>transferred</em>. A full calendar month is ~720-745 such
+chunks, so budget roughly <b>1.2-1.3 GB transferred per accumulated
+variable per month</b> the <em>first</em> time that (variable, year,
+month) is ever requested.
+
+<p>
+Since keeping the whole globe costs nothing beyond what a bbox-only
+fetch already pays for, <em>t.in.era5</em> does exactly that: every
+ARCO-ERA5 fetch is cached permanently, at full world coverage, under
+<b>arco_world_cache</b> (default <tt>$HOME/RSDATA/ERA5World</tt>),
+keyed only by (variable, reduction, year, month) -- deliberately
+independent of <b>area</b>, <b>output_prefix</b>, or which run asked
+for it. The very first request for a given (variable, month) anywhere
+in the world pays the full download; every later request for that same
+(variable, month) -- for <em>any</em> region, <em>any</em> project,
+<em>any</em> future run -- is served from that local file with no
+network access at all. Confirmed in practice: a second fetch for a
+different continent's bounding box, same month, dropped from ~82s to
+~0.05s. This directory grows over time by design (each cached month is
+a genuine, reusable slice of world coverage, compressed to a few MB per
+variable per month for typical fields) and is never pruned
+automatically -- treat it as a small, permanent local ERA5 mirror
+you're building up, and manage its size yourself if that ever matters.
+A handful of days for a brand-new month is still fast (a few minutes,
+paid once); only a large historical multi-month backfill of
+variables/months never requested before is slow, and even then only
+once -- for a true first-time bulk historical load, <b>-c</b> (CDS,
+which subsets server-side and so is cheaper per single request but
+never builds up a reusable local archive) may still be preferable.
+
+<h4>Estimated arco_world_cache disk usage</h4>
+
+Every cached month/variable is a full 721x1440 (0.25 deg)
+daily-resolution global field, ~126 MB uncompressed, compressed to
+roughly <b>60-65 MB</b> (measured: a real cached month of daily-mean
+temperature came to 63.5 MB against a 124.6 MB uncompressed baseline,
+~51% -- precipitation and potential evaporation are accumulated fields
+with large near-zero areas and should compress at least as well,
+likely somewhat better). For <tt>precipitation</tt>, <tt>temperature</tt>,
+and <tt>potential_evaporation</tt> over a 2021-2026 span (72 months if
+requesting through end of 2026 -- note ARCO itself only has data up to
+<tt>valid_time_stop_era5t</tt>, currently a few months behind "now", so
+fewer months will actually exist on disk until requested after ARCO
+catches up):
+
+<table>
+<tr><th></th><th>per variable</th><th>x 3 variables</th></tr>
+<tr><td>72 months</td><td>~4.6 GB</td><td><b>~14 GB</b></td></tr>
+<tr><td>65 months (roughly what's available as of writing)</td><td>~4.2 GB</td><td><b>~13 GB</b></td></tr>
+</table>
+
+<p>
+Requesting <tt>temperature_min</tt>/<tt>temperature_max</tt> in
+addition to <tt>temperature</tt> adds separate cache entries each of
+comparable size (same underlying hourly source, but cached per daily
+reduction -- mean, min, max are each their own file), roughly tripling
+the temperature share of this estimate if all three are used.
+
+<h3>Data freshness: final vs. preliminary (ERA5T), and the CDS gap-fill</h3>
+
+ARCO-ERA5 itself tracks two coverage boundaries in the store's own
+metadata (<tt>ds.attrs</tt>, confirmed via a live read):
+<tt>valid_time_stop</tt> (final, stable ERA5 -- permanent, never
+revised) and <tt>valid_time_stop_era5t</tt> (preliminary ERA5T --
+available sooner, but <b>silently revised in place</b> once the final
+ERA5 ships for that period, typically ~3 months later). A snapshot at
+time of writing: <tt>valid_time_stop=2026-04-30</tt>,
+<tt>valid_time_stop_era5t=2026-08-17</tt>.
+
+<p>
+<em>t.in.era5</em> checks these on every month it fetches from
+ARCO-ERA5, and caches accordingly:
+
+<ul>
+<li><b>Final</b> (within <tt>valid_time_stop</tt>): cached as
+<tt>&lt;var&gt;_&lt;reduction&gt;_&lt;year&gt;&lt;month&gt;.nc</tt> --
+trusted forever once cached, no re-check on later hits (final data
+never changes, so there's nothing to gain by re-touching ARCO for
+it).</li>
+<li><b>ERA5T / preliminary</b> (beyond <tt>valid_time_stop</tt> but
+within <tt>valid_time_stop_era5t</tt>): cached separately, as
+<tt>&lt;var&gt;_&lt;reduction&gt;_&lt;year&gt;&lt;month&gt;_era5t.nc</tt>
+-- this data is real and usable now, but is <em>not</em> guaranteed to
+be the exact values that will eventually be archived once ARCO ingests
+the final release for that month. Kept apart so a cache hit never
+silently serves stale-but-still-present-on-disk provisional data as if
+it were final: every <tt>_era5t</tt> cache hit re-checks ARCO's own
+<tt>valid_time_stop</tt> (cheap -- metadata only, no data re-fetch),
+and once the final release has landed, <em>t.in.era5</em> automatically
+fetches and caches the real final month and <b>deletes the superseded
+<tt>_era5t</tt> file</b> -- no stale provisional data left behind for
+good cleaning practice, and no manual cleanup needed.</li>
+<li><b>Not yet ingested at all</b> (beyond
+<tt>valid_time_stop_era5t</tt>): ARCO-ERA5 has nothing for this month
+yet -- not even provisionally. In this case <em>t.in.era5</em>
+automatically falls back to the CDS API for that one month only (needs
+<tt>~/.cdsapirc</tt>; a warning is printed), so the run still completes
+instead of silently producing a gap. <b>Is this the same data ARCO
+will eventually have for that month?</b> Not verifiably -- CDS and
+ARCO are independent pipelines (CDS's own ERA5T is itself provisional
+and can differ in fine detail from what ARCO eventually ingests), so
+this CDS-sourced fallback is cached under yet another distinct name
+(<tt>&lt;year&gt;&lt;month&gt;_arco_gap_cds.nc</tt>, in the per-run
+<b>cache_dir</b>, <em>not</em> the permanent world cache) rather than
+being trusted as equivalent to genuine ARCO data. It is never reused
+as a substitute once ARCO does ingest that month -- a later run will
+fetch and cache the real ARCO version normally.</li>
+</ul>
 
 <h2>VARIABLES</h2>
 
@@ -51,6 +224,14 @@ instead of re-downloading them.
 
 <h2>CDS ACCOUNT SETUP</h2>
 
+Only needed for the <b>ERA5-Land</b> tier (tried by default unless
+<b>-e</b> is given) and for the plain-ERA5 fallback tier if <b>-c</b>
+is given -- with <b>-e -c</b> never needed at all, and with just
+<b>-e</b> (ARCO-ERA5 default) or no flags at all, a missing/invalid
+<tt>~/.cdsapirc</tt> only causes the affected month to fall back
+further, with a warning, rather than aborting the whole run.
+
+<p>
 <em>t.in.era5</em> uses the <tt>cdsapi</tt> Python package, which reads
 credentials from <tt>~/.cdsapirc</tt>. Create a free account at
 <a href="https://cds.climate.copernicus.eu">https://cds.climate.copernicus.eu</a>,
@@ -64,9 +245,7 @@ key: &lt;your-personal-access-token&gt;
 </pre></div>
 
 (the <tt>url</tt>/<tt>key</tt> values above are the real format this
-file takes -- only the token itself is account-specific). Without this
-file (or with an invalid token), every CDS request <em>t.in.era5</em>
-makes will fail immediately with an authentication error.
+file takes -- only the token itself is account-specific).
 
 <h2>EXAMPLE</h2>
 

@@ -1,0 +1,10 @@
+# Extra Python dependencies t.in.era5 needs beyond what GRASS's own
+# Python already provides (numpy, GDAL's osgeo bindings). Installed into
+# a dedicated virtualenv by `make venv` (see Makefile) so a system-wide
+# `pip install` -- often blocked outright on modern Debian/Ubuntu by
+# PEP 668's externally-managed-environment guard -- is never needed.
+cdsapi
+xarray
+netCDF4
+gcsfs
+zarr
