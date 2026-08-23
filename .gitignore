@@ -1,0 +1,17 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# pytest / hypothesis
+.pytest_cache/
+.hypothesis/
+
+# virtualenvs (e.g. an ad hoc `python3 -m venv` run inside the repo;
+# `make venv`'s own venv normally lives outside the repo, under the
+# GRASS build tree's $(ETC)/t.in.era5/venv)
+.venv/
+venv/
+
+# editor/OS cruft
+.DS_Store
+*.swp
