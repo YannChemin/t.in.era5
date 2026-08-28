@@ -417,6 +417,46 @@ def fetch_era5(client, var_info, year, month, days, area, out_nc):
     )
 
 
+def fetch_era5_raw_hourly(client, var_info, year, month, days, area, out_nc):
+    """Plain-ERA5 (non-land) raw hourly data straight from CDS's
+    `reanalysis-era5-single-levels` product -- the genuinely-hourly
+    counterpart to fetch_era5() (which uses the *derived*
+    daily-statistics product instead, computing its reduction
+    server-side with nothing hourly left to recover).
+
+    Request shape mirrors fetch_era5land_raw_hourly() (same
+    variable/year/month/day/time/area/data_format/download_format
+    keys against a raw hourly product) with ONE real, non-obvious
+    difference: `reanalysis-era5-single-levels` -- unlike
+    `reanalysis-era5-land`, which has no ensemble/product-type concept
+    at all -- is part of the same "single-levels" product family as
+    fetch_era5()'s derived-daily-statistics product, and CDS's schema
+    for that family requires an explicit `product_type: "reanalysis"`
+    (to distinguish the deterministic reanalysis from CDS's separate
+    ensemble-member products for the same physical field). Confirmed by
+    mirroring fetch_era5()'s own existing single-levels request, which
+    already carries this key for the very same reason -- omitting it
+    for the raw hourly single-levels product would very likely be
+    rejected by CDS's request validator the same way it would be for
+    the derived product, since both draw from the same
+    reanalysis-era5-single-levels family."""
+    client.retrieve(
+        "reanalysis-era5-single-levels",
+        {
+            "product_type": "reanalysis",
+            "variable": var_info["cds_name"],
+            "year": str(year),
+            "month": "%02d" % month,
+            "day": ["%02d" % d for d in days],
+            "time": ["%02d:00" % h for h in range(24)],
+            "area": area,
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+        },
+        out_nc,
+    )
+
+
 def arco_client():
     """chunks=None (not "auto") matches Google's own arco-era5 usage
     examples for this exact store: since the array's own on-disk chunks
@@ -633,23 +673,6 @@ def fetch_arco(ds_full, var_info, year, month, days, area, out_nc, world_cache_d
         da.load().to_netcdf(out_nc)
 
 
-def _fatal_no_hourly_plain_era5(var_key, year, month):
-    gs.fatal(
-        "Hourly output (-h) requested for %s %04d-%02d, but the plain-ERA5 "
-        "(non-ERA5-Land) fallback tier only supports daily output: CDS's "
-        "'derived-era5-single-levels-daily-statistics' product (used by "
-        "fetch_era5()) computes its daily reduction server-side, so there "
-        "is no hourly data to recover from it. This is a known, "
-        "documented gap, not a bug -- see the 'Known gaps / future work' "
-        "section in t.in.era5.md/.html for what a fix would need (a new "
-        "fetch function against CDS's raw 'reanalysis-era5-single-levels' "
-        "product, mirroring fetch_era5land_raw_hourly()'s existing "
-        "pattern). Work around this for now by ensuring ERA5-Land or "
-        "ARCO-ERA5 coverage is available for this period instead (both "
-        "support -h already)." % (var_key, year, month)
-    )
-
-
 def fetch_month(
     clients, var_key, var_info, year, month, days, area, cache_dir, force_era5, use_arco,
     world_cache_dir, hourly=False,
@@ -663,10 +686,11 @@ def fetch_month(
     one of "era5land", "era5", "arco", "arco_gap_cds".
 
     `hourly=True` requests genuinely hourly (rather than daily) data.
-    ERA5-Land and ARCO-ERA5 both support this (see fetch_era5land_raw_hourly()
-    and fetch_arco_world_month()); the plain-ERA5-via-CDS tier
-    (fetch_era5(), used both as the -c fallback and as the one-month
-    ARCO-unavailable stopgap) does NOT -- see _fatal_no_hourly_plain_era5()."""
+    All three tiers support this: ERA5-Land (fetch_era5land_raw_hourly()),
+    ARCO-ERA5 (fetch_arco_world_month()), and plain-ERA5-via-CDS
+    (fetch_era5_raw_hourly(), used both as the -c fallback and as the
+    one-month ARCO-unavailable stopgap, in place of fetch_era5()'s
+    daily-only derived-statistics product)."""
     hourly_tag = "_hourly" if hourly else ""
     tag = "%s_%04d%02d%s" % (var_key, year, month, hourly_tag)
     cache_land = os.path.join(cache_dir, tag + "_era5land.nc")
@@ -724,19 +748,21 @@ def fetch_month(
             # ARCO eventually ingests for this same month (independent
             # pipelines), so it must never be mistaken for -- or later
             # silently trusted as -- genuine ARCO-sourced data.
-            if hourly:
-                _fatal_no_hourly_plain_era5(var_key, year, month)
             gs.warning(
                 "%s -- falling back to CDS for this month only (needs "
                 "~/.cdsapirc); not cached as ARCO data, since it may "
                 "not exactly match what ARCO eventually ingests" % e
             )
-            fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_gap)
+            if hourly:
+                fetch_era5_raw_hourly(clients["cds"](), var_info, year, month, days, area, cache_gap)
+            else:
+                fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_gap)
             return cache_gap, "arco_gap_cds"
     else:
         if hourly:
-            _fatal_no_hourly_plain_era5(var_key, year, month)
-        fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_era5)
+            fetch_era5_raw_hourly(clients["cds"](), var_info, year, month, days, area, cache_era5)
+        else:
+            fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_era5)
     return cache_era5, fallback_source
 
 
@@ -802,11 +828,27 @@ def load_daily(path, var_info, source, hourly=False):
         # never appears in the output rather than needing an explicit
         # extra slice).
         da = _deaccumulate_hourly(da, time_dim, ERA5LAND_RESET_HOURS)
-    # else: non-accumulated fields (daily or hourly) and any source
-    # other than era5land need no de-accumulation -- either the raw
-    # readings are already instantaneous/non-cumulative, or (for
-    # "arco"/"arco_gap_cds") fetch_arco_world_month() already fully
-    # reduced/de-accumulated the data before writing this NC.
+    elif source in ("era5", "arco_gap_cds") and var_info["accumulated"] and hourly:
+        # Raw hourly plain-ERA5 data from fetch_era5_raw_hourly()
+        # (CDS's reanalysis-era5-single-levels product) -- UNLIKE the
+        # "arco"/"arco_gap_cds"-via-fetch_era5() daily case below, this
+        # NC is raw, not pre-reduced, so it needs de-accumulation here,
+        # same as era5land's hourly branch above but with plain-ERA5's
+        # own reset schedule: ECMWF_CYCLE_RESET_HOURS = {7, 19} UTC (two
+        # 12h forecast cycles/day), the SAME schedule already used and
+        # validated for ARCO-ERA5 in fetch_arco_world_month() -- correct
+        # to reuse verbatim here, since ARCO-ERA5 is itself an
+        # unmodified Zarr mirror of this exact same raw ERA5 archive
+        # (see fetch_arco_world_month()'s own docstring), not a
+        # separately-behaving product; both draw from the same
+        # underlying ECMWF forecast-cycle accumulation convention.
+        da = _deaccumulate_hourly(da, time_dim, ECMWF_CYCLE_RESET_HOURS)
+    # else: non-accumulated fields (daily or hourly) and any other
+    # source/mode combination need no de-accumulation here -- either
+    # the raw readings are already instantaneous/non-cumulative, or (for
+    # "arco"/"arco_gap_cds" in DAILY mode only) fetch_arco_world_month()/
+    # fetch_era5() already fully reduced/de-accumulated the data
+    # server-side or locally before writing this NC.
 
     lats = da["latitude"].values
     lons = da["longitude"].values

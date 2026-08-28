@@ -415,19 +415,24 @@ def test_fetch_arco_world_month_hourly_and_daily_caches_are_distinct(tin, xr, np
     hourly_da.close()
 
 
-def test_fetch_month_hourly_plain_era5_fails_loudly(tin, xr, np, tmp_path, monkeypatch):
-    """The plain-ERA5-via-CDS tier (fetch_era5(), a daily-statistics CDS
-    product with no hourly output) must refuse hourly=True loudly rather
-    than silently returning daily data mislabeled as hourly -- both for
-    the plain -c-style tier and for the one-month ARCO-unavailable
-    stopgap that also calls fetch_era5()."""
-    import grass.script as gs
+def test_fetch_month_hourly_plain_era5_uses_raw_hourly_fetch(tin, xr, np, tmp_path, monkeypatch):
+    """The plain-ERA5-via-CDS tier (-c / use_arco=False) must route
+    hourly=True through fetch_era5_raw_hourly() (the genuinely-hourly
+    reanalysis-era5-single-levels product), NOT fetch_era5() (the
+    daily-statistics product with no hourly output to recover)."""
+    calls = {"raw_hourly": 0, "daily": 0}
 
-    gs.set_raise_on_error(True)
-    monkeypatch.setattr(
-        tin, "fetch_era5",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch_era5 must not run")),
-    )
+    def fake_raw_hourly(client, var_info, year, month, days, area, out_nc):
+        calls["raw_hourly"] += 1
+        xr.Dataset(
+            {"test_var": xr.DataArray([1.0], dims=("time",), coords={"time": [np.datetime64("2021-03-01T00")]})}
+        ).to_netcdf(out_nc)
+
+    def fake_daily(client, var_info, year, month, days, area, out_nc):
+        calls["daily"] += 1
+
+    monkeypatch.setattr(tin, "fetch_era5_raw_hourly", fake_raw_hourly)
+    monkeypatch.setattr(tin, "fetch_era5", fake_daily)
 
     var_info = {"cds_name": "test_var", "accumulated": False, "daily_statistic": "daily_mean"}
     clients = {
@@ -435,24 +440,32 @@ def test_fetch_month_hourly_plain_era5_fails_loudly(tin, xr, np, tmp_path, monke
         "arco": lambda: (_ for _ in ()).throw(AssertionError("ARCO must not be tried")),
     }
 
-    # use_arco=False: the plain -c tier itself has no hourly path.
-    with pytest.raises(Exception):
-        tin.fetch_month(
-            clients, "test_var", var_info, 2021, 3, [1], [10.0, 0.0, 0.0, 1.0],
-            str(tmp_path), True, False, str(tmp_path / "world"), hourly=True,
-        )
-
-
-def test_fetch_month_hourly_arco_gap_cds_fails_loudly(tin, xr, np, tmp_path, monkeypatch):
-    """Same as above, but via the ARCO-unavailable one-month CDS stopgap
-    path specifically (use_arco=True, ARCO raises ArcoDataUnavailable)."""
-    import grass.script as gs
-
-    gs.set_raise_on_error(True)
-    monkeypatch.setattr(
-        tin, "fetch_era5",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch_era5 must not run")),
+    path, source = tin.fetch_month(
+        clients, "test_var", var_info, 2021, 3, [1], [10.0, 0.0, 0.0, 1.0],
+        str(tmp_path), True, False, str(tmp_path / "world"), hourly=True,
     )
+    assert calls == {"raw_hourly": 1, "daily": 0}
+    assert source == "era5"
+    assert "_hourly" in os.path.basename(path)  # distinct from the daily cache tag
+
+
+def test_fetch_month_hourly_arco_gap_cds_uses_raw_hourly_fetch(tin, xr, np, tmp_path, monkeypatch):
+    """Same routing requirement, via the ARCO-unavailable one-month CDS
+    stopgap path specifically (use_arco=True, ARCO raises
+    ArcoDataUnavailable)."""
+    calls = {"raw_hourly": 0, "daily": 0}
+
+    def fake_raw_hourly(client, var_info, year, month, days, area, out_nc):
+        calls["raw_hourly"] += 1
+        xr.Dataset(
+            {"test_var": xr.DataArray([1.0], dims=("time",), coords={"time": [np.datetime64("2027-01-01T00")]})}
+        ).to_netcdf(out_nc)
+
+    def fake_daily(client, var_info, year, month, days, area, out_nc):
+        calls["daily"] += 1
+
+    monkeypatch.setattr(tin, "fetch_era5_raw_hourly", fake_raw_hourly)
+    monkeypatch.setattr(tin, "fetch_era5", fake_daily)
 
     def unavailable_arco():
         ds = xr.Dataset(
@@ -465,11 +478,74 @@ def test_fetch_month_hourly_arco_gap_cds_fails_loudly(tin, xr, np, tmp_path, mon
     var_info = {"cds_name": "test_var", "accumulated": False, "daily_statistic": "daily_mean"}
     clients = {"cds": lambda: object(), "arco": unavailable_arco}
 
-    with pytest.raises(Exception):
-        tin.fetch_month(
-            clients, "test_var", var_info, 2027, 1, [1], [10.0, 0.0, 0.0, 1.0],
-            str(tmp_path), True, True, str(tmp_path / "world"), hourly=True,
+    path, source = tin.fetch_month(
+        clients, "test_var", var_info, 2027, 1, [1], [10.0, 0.0, 0.0, 1.0],
+        str(tmp_path), True, True, str(tmp_path / "world"), hourly=True,
+    )
+    assert calls == {"raw_hourly": 1, "daily": 0}
+    assert source == "arco_gap_cds"
+    assert "_hourly" in os.path.basename(path)
+
+
+def test_fetch_era5_raw_hourly_request_has_product_type(tin, monkeypatch):
+    """Real, non-obvious difference from fetch_era5land_raw_hourly():
+    reanalysis-era5-single-levels (unlike reanalysis-era5-land, which
+    has no product-type concept at all) is part of the same
+    single-levels product family fetch_era5()'s derived-daily-statistics
+    request already sends product_type="reanalysis" against -- CDS's
+    schema for that family requires it. Confirm the raw hourly plain-ERA5
+    request actually carries this key (a request missing it would very
+    plausibly be rejected by the real CDS API, which this synthetic test
+    has no way to catch any other way)."""
+    captured = {}
+
+    class FakeClient:
+        def retrieve(self, product, request, out_nc):
+            captured["product"] = product
+            captured["request"] = request
+
+    var_info = {"cds_name": "total_precipitation", "accumulated": True}
+    tin.fetch_era5_raw_hourly(
+        FakeClient(), var_info, 2021, 3, [1, 2], [10.0, 0.0, 0.0, 1.0], "/tmp/unused.nc"
+    )
+    assert captured["product"] == "reanalysis-era5-single-levels"
+    assert captured["request"]["product_type"] == "reanalysis"
+    assert captured["request"]["time"] == ["%02d:00" % h for h in range(24)]
+
+
+def test_load_daily_hourly_plain_era5_deaccumulates_with_ecmwf_cycle_schedule(tin, xr, np, tmp_path):
+    """The plumbing test analogous to the ARCO hourly de-accumulation
+    check above: load_daily() with source="era5" (or "arco_gap_cds"),
+    hourly=True, and an accumulated variable must route through
+    _deaccumulate_hourly() with ECMWF_CYCLE_RESET_HOURS -- the exact
+    same schedule/helper already validated for ARCO-ERA5 (correct to
+    reuse, since ARCO is an unmodified mirror of this same raw
+    archive -- see fetch_era5_raw_hourly()'s docstring)."""
+    year, month, days = 2021, 3, [1, 2]
+    month_start = np.datetime64("2021-03-01")
+    fetch_start = month_start - np.timedelta64(1, "h")
+    month_end_excl = month_start + np.timedelta64(len(days), "D")
+
+    increment = 0.003
+    series = _make_accumulated_series(xr, np, fetch_start, month_end_excl, increment)
+    series.name = "total_precipitation"
+    nc_path = tmp_path / "era5_raw_hourly.nc"
+    xr.Dataset({"total_precipitation": series}).to_netcdf(nc_path)
+
+    var_info = {"cds_name": "total_precipitation", "accumulated": True}
+    for source in ("era5", "arco_gap_cds"):
+        timestamps, values, _, _ = tin.load_daily(str(nc_path), var_info, source, hourly=True)
+        assert len(timestamps) == len(days) * 24
+        for v in values:
+            np.testing.assert_allclose(v, increment, rtol=1e-9)
+        # sum one full day and cross-check against the known true total,
+        # the same standard test_fetch_arco_world_month_hourly_deaccumulates_per_hour
+        # already applies to the identical math via the ARCO code path.
+        day_total = sum(
+            v[0, 0] for t, v in zip(timestamps, values)
+            if t.date() == month_start.astype("datetime64[D]").astype(object)
         )
+        np.testing.assert_allclose(day_total, 24 * increment, rtol=1e-9)
 
 
 def test_fetch_month_falls_back_to_cds_and_caches_separately_when_arco_unavailable(

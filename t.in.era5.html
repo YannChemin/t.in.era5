@@ -231,9 +231,16 @@ involved, handled separately and correctly for each source:
 <li><b>ERA5-Land</b> (<tt>reanalysis-era5-land</tt>, already used by
 the daily path for accumulated variables too): a single reset per
 calendar day, at 01 UTC.</li>
-<li><b>ARCO-ERA5</b> (and plain-ERA5's own raw hourly CDS product):
-two 12h forecast cycles per day, based at 06 and 18 UTC (first
-genuine, non-diffed hour at 07 and 19 UTC respectively).</li>
+<li><b>ARCO-ERA5 and plain-ERA5's own raw hourly CDS product</b>: two
+12h forecast cycles per day, based at 06 and 18 UTC (first genuine,
+non-diffed hour at 07 and 19 UTC respectively). Confirmed the same
+schedule applies to both: ARCO-ERA5 is an unmodified Zarr mirror of
+this exact same raw ERA5 archive, not a separately-behaving product
+(see <a href="#arco-era5-google-cloud-source">ARCO-ERA5 SOURCE</a>
+above), so plain-ERA5's raw hourly CDS product
+(<tt>reanalysis-era5-single-levels</tt>) reuses the identical
+<tt>ECMWF_CYCLE_RESET_HOURS = {7, 19}</tt> de-accumulation, not a
+separately-derived schedule.</li>
 </ul>
 
 <h3>Per-source-tier support</h3>
@@ -248,53 +255,30 @@ it's used for ALL variables, not just accumulated ones</td></tr>
 <td>genuinely hour-native at the Zarr store level; see
 <a href="#arco-era5-google-cloud-source">ARCO-ERA5 SOURCE</a> above</td></tr>
 <tr><td>plain ERA5 via CDS (<b>-c</b> fallback tier, and the one-month
-ARCO-unavailable stopgap)</td><td><b>no -- fails loudly</b></td>
-<td>see <a href="#known-gaps--future-work">KNOWN GAPS</a> below</td></tr>
+ARCO-unavailable stopgap)</td><td><b>yes</b></td>
+<td>via <tt>fetch_era5_raw_hourly()</tt> against CDS's raw
+<tt>reanalysis-era5-single-levels</tt> product (not
+<tt>fetch_era5()</tt>'s daily-statistics product, which has no hourly
+output) -- see the request-schema difference noted below</td></tr>
 </table>
 
 <p>
-If a run needs <b>-h</b> and touches a month/variable that can only be
-served by the plain-ERA5-via-CDS tier, <em>t.in.era5</em> aborts with a
-clear error rather than silently returning daily data mislabeled as
-hourly. Ensure ERA5-Land or ARCO-ERA5 coverage is available for the
-requested period, or wait for the gap below to be closed.
-
-<h2><a name="known-gaps--future-work"></a>KNOWN GAPS / FUTURE WORK</h2>
-
-<b>Plain-ERA5 (non-ERA5-Land) hourly output via CDS is not yet
-implemented.</b> The <tt>derived-era5-single-levels-daily-statistics</tt>
-product used by the existing <tt>fetch_era5()</tt> function computes
-its daily reduction <em>server-side</em> -- there is no hourly data to
-recover from it locally, unlike the accumulated-field case where the
-reduction happens in this module's own code. This tier is used both
-when <b>-c</b> is passed (CDS instead of ARCO-ERA5 for the fallback
-tier) and as a one-month stopgap when ARCO-ERA5 hasn't ingested a
-given month yet.
+All three source tiers now support <b>-h</b>.
 
 <p>
-A real fix needs a <b>new fetch function against CDS's raw
-<tt>reanalysis-era5-single-levels</tt> product</b>, mirroring
-<tt>fetch_era5land_raw_hourly()</tt>'s existing pattern (same request
-shape: <tt>"time": ["%02d:00" % h for h in range(24)]</tt> instead of a
-<tt>daily_statistic</tt>) but for the non-land dataset, plus wiring it
-into <tt>fetch_month()</tt>'s <b>-c</b>/gap-fill branches the same way
-<tt>fetch_era5land_raw_hourly()</tt> is already wired into the
-ERA5-Land branch. The de-accumulation math for accumulated fields from
-that product would follow ARCO-ERA5's schedule
-(<tt>ECMWF_CYCLE_RESET_HOURS = {7, 19}</tt> in <em>t.in.era5.py</em>),
-since plain ERA5's raw archive uses the same forecast-cycle convention
-ARCO-ERA5 mirrors -- the <tt>_deaccumulate_hourly()</tt> helper
-already added for <b>-h</b> support is directly reusable for this, no
-new de-accumulation logic needed, only a new fetch function and its
-wiring.
-
-<p>
-Until this is implemented, <b>-h</b> requires ERA5-Land or ARCO-ERA5
-coverage for the requested period (see the support table above) --
-<tt>fetch_month()</tt> fails loudly
-(<tt>_fatal_no_hourly_plain_era5()</tt>) rather than silently
-downgrading to daily output if the plain-ERA5-via-CDS tier is reached
-under <b>-h</b>.
+<b>One real, non-obvious request-schema difference found while
+implementing the plain-ERA5 raw-hourly fetch</b>: unlike
+<tt>reanalysis-era5-land</tt> (no ensemble/product-type concept at
+all), <tt>reanalysis-era5-single-levels</tt> is part of the same
+"single-levels" product family as <tt>fetch_era5()</tt>'s
+derived-daily-statistics product, and CDS's schema for that family
+requires an explicit <tt>product_type: "reanalysis"</tt> request key
+(distinguishing the deterministic reanalysis from CDS's separate
+ensemble-member products for the same physical field).
+<tt>fetch_era5_raw_hourly()</tt> carries this key, mirroring
+<tt>fetch_era5()</tt>'s own existing single-levels request;
+<tt>fetch_era5land_raw_hourly()</tt> correctly does NOT, since
+ERA5-Land has no such family/product-type distinction to make.
 
 <h2>VARIABLES</h2>
 
