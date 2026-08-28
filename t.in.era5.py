@@ -83,6 +83,10 @@
 # % key: c
 # % description: Use the CDS API instead of ARCO-ERA5 (Google Cloud) for the plain-ERA5 tier -- requires a working ~/.cdsapirc for that tier too; by default that tier reads the public, no-login ARCO-ERA5 Zarr archive instead
 # %end
+# %flag
+# % key: h
+# % description: Hourly output instead of daily -- one raster per hour (~24x more STRDS maps for the same period, budget cache space and t.register time accordingly). Supported by every source tier (ERA5-Land raw-hourly, ARCO-ERA5, and plain-ERA5 raw-hourly via CDS); accumulated fields (precipitation, potential_evaporation, solar_radiation, snowfall) are correctly de-accumulated to genuine per-hour amounts, not just relabeled daily totals -- see NOTES in t.in.era5.md for each source's forecast-cycle reset schedule
+# %end
 
 import atexit
 import calendar
@@ -161,6 +165,57 @@ ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.za
 # the requested area is free: ARCO-ERA5's chunking already forces a
 # whole-globe download per hour touched, area or no area).
 ARCO_WORLD_CACHE_DEFAULT = os.path.expanduser(os.path.join("~", "RSDATA", "ERA5World"))
+
+
+def _deaccumulate_hourly(da, time_dim, reset_hours):
+    """De-accumulates a raw ECMWF forecast-accumulated hourly field into
+    genuine per-hour amounts. ECMWF's raw accumulated fields (total
+    precipitation, potential_evaporation, solar_radiation, snowfall) are
+    NOT hourly increments -- each value is a running total since the
+    most recent "reset" hour, climbing monotonically until the next
+    reset. So: the reading at a reset hour is itself already a genuine
+    1-hour amount (nothing to diff against -- the previous reading
+    belongs to a different accumulation cycle entirely); every other
+    reading must be differenced from the immediately preceding hour to
+    recover that hour's own amount.
+
+    `reset_hours` is the set of UTC hours (0..23) at which a fresh
+    accumulation cycle begins. Two real, DIFFERENT schedules are used by
+    this module's two raw-hourly sources -- do not conflate them:
+      - ARCO-ERA5 / plain-ERA5's raw forecast-cycle data: two 12h cycles
+        per day, based at 06 and 18 UTC, each cycle's first VALID
+        (non-zero) hour at 07 and 19 UTC respectively -> reset_hours =
+        {7, 19} (see fetch_arco_world_month()'s docstring; the same
+        convention applies to plain-ERA5's raw hourly CDS product,
+        since ARCO is an unmodified Zarr mirror of that same archive).
+      - ERA5-Land's raw hourly data: a single reset per calendar day, at
+        01 UTC -> reset_hours = {1} (see load_daily()'s original
+        daily-reduction comment, confirmed by inspection there: values
+        climb from near-zero at 01 UTC to a peak at 00 UTC the
+        following day).
+
+    Returns a DataArray one element shorter than `da` along `time_dim`
+    (xr.diff()'s usual length reduction) -- the first output element
+    corresponds to da's SECOND input timestamp, since there is nothing
+    to output for the very first raw reading (it's consumed as the base
+    point for whatever comes after it, unless it happens to itself be a
+    reset hour, in which case it's returned as-is rather than diffed)."""
+    import xarray as xr
+
+    hour = da[time_dim].dt.hour
+    diffed = da.diff(time_dim)
+    is_reset = hour[1:].isin(list(reset_hours))
+    hourly = xr.where(is_reset, da.isel({time_dim: slice(1, None)}), diffed)
+    return hourly.assign_coords({time_dim: da[time_dim].isel({time_dim: slice(1, None)})})
+
+
+# ECMWF raw forecast-cycle accumulated fields (ARCO-ERA5 and plain-ERA5's
+# raw hourly CDS product both use this schedule -- see
+# _deaccumulate_hourly()'s docstring): two 12h cycles/day based at 06/18
+# UTC, first valid (genuine, non-diffed) hour at 07/19 UTC.
+ECMWF_CYCLE_RESET_HOURS = {7, 19}
+# ERA5-Land's raw hourly accumulated fields: single daily reset at 01 UTC.
+ERA5LAND_RESET_HOURS = {1}
 
 
 class ArcoDataUnavailable(Exception):
@@ -408,13 +463,24 @@ def _arco_select_area(da, area):
     return da.assign_coords(longitude=new_lon).sortby("longitude")
 
 
-def fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir):
-    """Fetches (unless already cached) one variable's FULL-GLOBE daily
-    data for one calendar month straight out of the ARCO-ERA5 Zarr
-    store, and caches it *permanently* under world_cache_dir, keyed only
-    by (cds_name, accumulated-or-statistic, year, month) -- deliberately
-    independent of `area`, `output_prefix`, or anything else about the
-    calling run. Returns the path to that cached global NetCDF.
+def fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir, hourly=False):
+    """Fetches (unless already cached) one variable's FULL-GLOBE data
+    (daily-reduced, or genuinely hourly if `hourly=True`) for one
+    calendar month straight out of the ARCO-ERA5 Zarr store, and caches
+    it *permanently* under world_cache_dir, keyed by (cds_name,
+    accumulated-or-statistic, year, month, daily-or-hourly) --
+    deliberately independent of `area`, `output_prefix`, or anything
+    else about the calling run. Returns the path to that cached global
+    NetCDF. The daily and hourly caches for the same (variable, month)
+    are kept as entirely separate files (see base_tag below) so a run
+    requesting one granularity never collides with or is mistaken for a
+    cache of the other.
+
+    When `hourly=True`: accumulated fields are de-accumulated to genuine
+    per-hour amounts via _deaccumulate_hourly() (ECMWF_CYCLE_RESET_HOURS
+    schedule -- see that function's docstring) instead of being summed
+    to a daily total; non-accumulated fields are returned as their raw
+    hourly readings, with no daily_statistic reduction applied at all.
 
     Why cache the whole globe instead of just the requested area: per
     arco-era5's own README, this array's on-disk Zarr chunking is
@@ -472,7 +538,9 @@ def fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir
     month_start = np.datetime64("%04d-%02d-01" % (year, month))
     month_end_excl = month_start + np.timedelta64(n_days, "D")
 
-    base_tag = "%s_%s_%04d%02d" % (varname, reduction, year, month)
+    base_tag = "%s_%s_%04d%02d%s" % (
+        varname, reduction, year, month, "_hourly" if hourly else "",
+    )
     final_nc = os.path.join(world_cache_dir, base_tag + ".nc")
     era5t_nc = os.path.join(world_cache_dir, base_tag + "_era5t.nc")
 
@@ -506,29 +574,34 @@ def fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir
         fetch_start = month_start
     da = da.sel(time=slice(fetch_start, month_end_excl - np.timedelta64(1, "h")))
 
-    if var_info["accumulated"]:
-        hour = da["time"].dt.hour
-        diffed = da.diff("time")
-        is_cycle_start = (hour[1:] == 7) | (hour[1:] == 19)
-        hourly = xr.where(is_cycle_start, da.isel(time=slice(1, None)), diffed)
-        hourly = hourly.assign_coords(time=da["time"].isel(time=slice(1, None)))
-        daily = hourly.resample(time="1D").sum()
+    if hourly:
+        if var_info["accumulated"]:
+            result = _deaccumulate_hourly(da, "time", ECMWF_CYCLE_RESET_HOURS)
+        else:
+            result = da  # raw hourly readings ARE the hourly values, no reduction
+        result = result.sel(
+            time=slice(month_start, month_end_excl - np.timedelta64(1, "h"))
+        )
+    elif var_info["accumulated"]:
+        hourly_vals = _deaccumulate_hourly(da, "time", ECMWF_CYCLE_RESET_HOURS)
+        result = hourly_vals.resample(time="1D").sum()
+        result = result.sel(time=slice(month_start, month_end_excl - np.timedelta64(1, "D")))
     else:
         stat_fn = {
             "daily_mean": lambda r: r.mean(),
             "daily_minimum": lambda r: r.min(),
             "daily_maximum": lambda r: r.max(),
         }[var_info["daily_statistic"]]
-        daily = stat_fn(da.resample(time="1D"))
+        result = stat_fn(da.resample(time="1D"))
+        result = result.sel(time=slice(month_start, month_end_excl - np.timedelta64(1, "D")))
 
-    daily = daily.sel(time=slice(month_start, month_end_excl - np.timedelta64(1, "D")))
-    daily.name = varname
+    result.name = varname
 
     os.makedirs(world_cache_dir, exist_ok=True)
     # write-then-rename: a run killed mid-write never leaves a corrupt
     # file behind for a later run to mistake for a complete cache entry.
     tmp_nc = world_nc + ".tmp"
-    daily.load().to_netcdf(tmp_nc, encoding={varname: dict(zlib=True, complevel=4)})
+    result.load().to_netcdf(tmp_nc, encoding={varname: dict(zlib=True, complevel=4)})
     os.replace(tmp_nc, world_nc)
 
     if world_nc == final_nc and era5t_cached:
@@ -541,24 +614,45 @@ def fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir
     return world_nc
 
 
-def fetch_arco(ds_full, var_info, year, month, days, area, out_nc, world_cache_dir):
+def fetch_arco(ds_full, var_info, year, month, days, area, out_nc, world_cache_dir, hourly=False):
     """Crops the permanently-cached full-world month for this variable
     (see fetch_arco_world_month()) to `area`, writing the small result
-    to out_nc in the same daily-resolution shape a CDS daily-statistics
-    download would have (so load_daily() needs no ARCO-specific
-    branch). Only fetch_arco_world_month() ever talks to Google Cloud;
-    this function is a purely local crop, cheap regardless of area."""
+    to out_nc in the same daily-resolution shape (or hourly, if
+    `hourly=True`) a CDS daily-statistics download would have (so
+    load_daily() needs no ARCO-specific branch -- the NC this writes is
+    already fully reduced/de-accumulated to its final granularity).
+    Only fetch_arco_world_month() ever talks to Google Cloud; this
+    function is a purely local crop, cheap regardless of area."""
     import xarray as xr
 
-    world_nc = fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir)
+    world_nc = fetch_arco_world_month(
+        ds_full, var_info, year, month, days, world_cache_dir, hourly=hourly
+    )
     with xr.open_dataset(world_nc) as world_ds:
         da = _arco_select_area(world_ds[var_info["cds_name"]], area)
         da.load().to_netcdf(out_nc)
 
 
+def _fatal_no_hourly_plain_era5(var_key, year, month):
+    gs.fatal(
+        "Hourly output (-h) requested for %s %04d-%02d, but the plain-ERA5 "
+        "(non-ERA5-Land) fallback tier only supports daily output: CDS's "
+        "'derived-era5-single-levels-daily-statistics' product (used by "
+        "fetch_era5()) computes its daily reduction server-side, so there "
+        "is no hourly data to recover from it. This is a known, "
+        "documented gap, not a bug -- see the 'Known gaps / future work' "
+        "section in t.in.era5.md/.html for what a fix would need (a new "
+        "fetch function against CDS's raw 'reanalysis-era5-single-levels' "
+        "product, mirroring fetch_era5land_raw_hourly()'s existing "
+        "pattern). Work around this for now by ensuring ERA5-Land or "
+        "ARCO-ERA5 coverage is available for this period instead (both "
+        "support -h already)." % (var_key, year, month)
+    )
+
+
 def fetch_month(
     clients, var_key, var_info, year, month, days, area, cache_dir, force_era5, use_arco,
-    world_cache_dir,
+    world_cache_dir, hourly=False,
 ):
     """Downloads (or reuses a cached copy of) one variable's data for one
     calendar month, trying ERA5-Land first unless force_era5, then either
@@ -566,8 +660,15 @@ def fetch_month(
     and if use_arco but ARCO-ERA5 has not ingested this month at all yet
     (see ArcoDataUnavailable), CDS as a one-month-only stopgap for that
     gap, cached separately (see below). Returns (path, source), source
-    one of "era5land", "era5", "arco", "arco_gap_cds"."""
-    tag = "%s_%04d%02d" % (var_key, year, month)
+    one of "era5land", "era5", "arco", "arco_gap_cds".
+
+    `hourly=True` requests genuinely hourly (rather than daily) data.
+    ERA5-Land and ARCO-ERA5 both support this (see fetch_era5land_raw_hourly()
+    and fetch_arco_world_month()); the plain-ERA5-via-CDS tier
+    (fetch_era5(), used both as the -c fallback and as the one-month
+    ARCO-unavailable stopgap) does NOT -- see _fatal_no_hourly_plain_era5()."""
+    hourly_tag = "_hourly" if hourly else ""
+    tag = "%s_%04d%02d%s" % (var_key, year, month, hourly_tag)
     cache_land = os.path.join(cache_dir, tag + "_era5land.nc")
     cache_era5 = os.path.join(cache_dir, tag + ("_arco.nc" if use_arco else "_era5.nc"))
     fallback_source = "arco" if use_arco else "era5"
@@ -579,7 +680,15 @@ def fetch_month(
 
     if not force_era5:
         try:
-            if var_info["accumulated"]:
+            # ERA5-Land's raw-hourly CDS product (reanalysis-era5-land)
+            # carries every variable at native hourly resolution
+            # regardless of accumulated/instantaneous -- so in hourly
+            # mode it's the right fetch for BOTH cases, not just
+            # accumulated ones (unlike the daily path below, which must
+            # route non-accumulated fields through the separate
+            # daily-statistics product since accumulated fields can't
+            # use that product at all -- see VARIABLES' docstring note).
+            if hourly or var_info["accumulated"]:
                 fetch_era5land_raw_hourly(
                     clients["cds"](), var_info, year, month, days, area, cache_land
                 )
@@ -603,7 +712,7 @@ def fetch_month(
         try:
             fetch_arco(
                 clients["arco"](), var_info, year, month, days, area, cache_era5,
-                world_cache_dir,
+                world_cache_dir, hourly=hourly,
             )
             return cache_era5, fallback_source
         except ArcoDataUnavailable as e:
@@ -615,6 +724,8 @@ def fetch_month(
             # ARCO eventually ingests for this same month (independent
             # pipelines), so it must never be mistaken for -- or later
             # silently trusted as -- genuine ARCO-sourced data.
+            if hourly:
+                _fatal_no_hourly_plain_era5(var_key, year, month)
             gs.warning(
                 "%s -- falling back to CDS for this month only (needs "
                 "~/.cdsapirc); not cached as ARCO data, since it may "
@@ -623,14 +734,20 @@ def fetch_month(
             fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_gap)
             return cache_gap, "arco_gap_cds"
     else:
+        if hourly:
+            _fatal_no_hourly_plain_era5(var_key, year, month)
         fetch_era5(clients["cds"](), var_info, year, month, days, area, cache_era5)
     return cache_era5, fallback_source
 
 
-def load_daily(path, var_info, source):
-    """Returns a (dates, values, lats, lons) tuple: dates is a sorted list
-    of datetime.date, values a matching list of 2D numpy arrays (native
-    CDS units, not yet unit-converted), lats/lons the grid coordinates."""
+def load_daily(path, var_info, source, hourly=False):
+    """Returns a (timestamps, values, lats, lons) tuple: timestamps a
+    sorted list of timezone-aware datetime.datetime (UTC) -- one per DAY
+    when hourly=False (always at implicit 00:00, the existing daily
+    convention), one per HOUR when hourly=True -- values a matching list
+    of 2D numpy arrays (native CDS units, not yet unit-converted),
+    lats/lons the grid coordinates. Callers needing a plain
+    datetime.date for the daily case can call .date() on each entry."""
     import xarray as xr
 
     ds = xr.open_dataset(path)
@@ -638,7 +755,7 @@ def load_daily(path, var_info, source):
     da = ds[varname]
     time_dim = "valid_time" if "valid_time" in da.dims else "time"
 
-    if source == "era5land" and var_info["accumulated"]:
+    if source == "era5land" and var_info["accumulated"] and not hourly:
         # reanalysis-era5-land's raw hourly accumulated fields are NOT
         # hour-differenced increments -- confirmed by inspection: each
         # field resets near zero at hour 01 UTC and climbs
@@ -670,18 +787,38 @@ def load_daily(path, var_info, source):
         # keeping it here would register the same date twice and crash
         # t.register with a UNIQUE constraint violation.
         da = da.isel({time_dim: slice(1, None)})
+    elif source == "era5land" and var_info["accumulated"] and hourly:
+        # Same raw ERA5-Land data as above, but recovering genuine
+        # PER-HOUR amounts instead of collapsing to a daily total -- see
+        # _deaccumulate_hourly()'s docstring for the general method and
+        # ERA5LAND_RESET_HOURS for this source's specific reset
+        # schedule (single reset at 01 UTC, unlike ARCO/plain-ERA5's
+        # 07/19 UTC two-cycle schedule). The very first fetched raw
+        # reading (hour 00 on day 1 of this month's file) is dropped
+        # implicitly by _deaccumulate_hourly()'s diff (it's the tail end
+        # of the *previous* day's/month's cycle, not itself a reset hour
+        # and not diffable against anything in this chunk -- the same
+        # edge case the daily branch above documents, here it simply
+        # never appears in the output rather than needing an explicit
+        # extra slice).
+        da = _deaccumulate_hourly(da, time_dim, ERA5LAND_RESET_HOURS)
+    # else: non-accumulated fields (daily or hourly) and any source
+    # other than era5land need no de-accumulation -- either the raw
+    # readings are already instantaneous/non-cumulative, or (for
+    # "arco"/"arco_gap_cds") fetch_arco_world_month() already fully
+    # reduced/de-accumulated the data before writing this NC.
 
     lats = da["latitude"].values
     lons = da["longitude"].values
-    dates = [
+    timestamps = [
         datetime.datetime.fromtimestamp(
             t.astype("datetime64[s]").astype(int), tz=datetime.timezone.utc
-        ).date()
+        )
         for t in da[time_dim].values
     ]
     values = [da.isel({time_dim: i}).values for i in range(da.sizes[time_dim])]
     ds.close()
-    return dates, values, lats, lons
+    return timestamps, values, lats, lons
 
 
 def write_geotiff(path, array, lons, lats, nodata=-9999.0, fallback_res_deg=None):
@@ -768,6 +905,22 @@ def main():
 
     force_era5 = bool(flags["e"])
     use_arco = not bool(flags["c"])
+    hourly = bool(flags["h"])
+
+    # Bounds for filtering loaded timestamps against [start_date,
+    # end_date]: daily-mode timestamps compare as plain dates; hourly
+    # timestamps need a full-precision, timezone-aware [00:00:00 of
+    # start_date, 23:59:59 of end_date] UTC window instead, since a
+    # bare datetime.date isn't comparable to a datetime.datetime.
+    if hourly:
+        start_bound = datetime.datetime.combine(
+            start_date, datetime.time.min, tzinfo=datetime.timezone.utc
+        )
+        end_bound = datetime.datetime.combine(
+            end_date, datetime.time.max, tzinfo=datetime.timezone.utc
+        )
+    else:
+        start_bound, end_bound = start_date, end_date
 
     # Lazily built and cached on first use, so a run that only needs one
     # of the two backends (e.g. -e without -c, the default's plain-ERA5
@@ -785,7 +938,7 @@ def main():
 
     for var_key in var_keys:
         var_info = VARIABLES[var_key]
-        all_dates = []
+        all_timestamps = []
         all_values = []
         lats = lons = None
         sources_used = set()
@@ -793,17 +946,18 @@ def main():
         for year, month, days in month_chunks(start_date, end_date):
             path, source = fetch_month(
                 clients, var_key, var_info, year, month, days, area, cache_dir,
-                force_era5, use_arco, world_cache_dir,
+                force_era5, use_arco, world_cache_dir, hourly=hourly,
             )
             sources_used.add(source)
-            dates, values, lats, lons = load_daily(path, var_info, source)
-            for d, v in zip(dates, values):
-                if start_date <= d <= end_date:
-                    all_dates.append(d)
+            timestamps, values, lats, lons = load_daily(path, var_info, source, hourly=hourly)
+            for t, v in zip(timestamps, values):
+                t_cmp = t if hourly else t.date()
+                if start_bound <= t_cmp <= end_bound:
+                    all_timestamps.append(t)
                     all_values.append(var_info["convert"](v))
 
-        order = sorted(range(len(all_dates)), key=lambda i: all_dates[i])
-        all_dates = [all_dates[i] for i in order]
+        order = sorted(range(len(all_timestamps)), key=lambda i: all_timestamps[i])
+        all_timestamps = [all_timestamps[i] for i in order]
         all_values = [all_values[i] for i in order]
 
         strds = "%s_%s" % (options["output_prefix"], var_key)
@@ -825,22 +979,24 @@ def main():
             fallback_res_deg = NATIVE_RESOLUTION_DEG["era5"]
 
         raster_names = []
-        for d, v in zip(all_dates, all_values):
-            base = "%s_%s" % (strds, d.strftime("%Y%m%d"))
+        name_fmt = "%Y%m%d%H" if hourly else "%Y%m%d"
+        for t, v in zip(all_timestamps, all_values):
+            base = "%s_%s" % (strds, t.strftime(name_fmt))
             tif = os.path.join(cache_dir, base + ".tif")
             write_geotiff(tif, v, lons, lats, fallback_res_deg=fallback_res_deg)
             gs.run_command(
                 "r.import", input=tif, output=base, overwrite=True, quiet=True
             )
             os.remove(tif)
-            raster_names.append((base, d))
+            raster_names.append((base, t))
             TMP_RASTERS.append(base)
 
         if raster_names:
+            register_fmt = "%Y-%m-%d %H:%M:%S" if hourly else "%Y-%m-%d"
             maps_file = os.path.join(cache_dir, "%s_register.txt" % strds)
             with open(maps_file, "w") as f:
-                for base, d in raster_names:
-                    f.write("%s|%s\n" % (base, d.strftime("%Y-%m-%d")))
+                for base, t in raster_names:
+                    f.write("%s|%s\n" % (base, t.strftime(register_fmt)))
             gs.run_command("t.register", input=strds, file=maps_file)
             os.remove(maps_file)
 
@@ -849,8 +1005,11 @@ def main():
         del TMP_RASTERS[:]
 
         gs.message(
-            "Wrote %d days to STRDS <%s> (sources used: %s)"
-            % (len(raster_names), strds, ", ".join(sorted(sources_used)))
+            "Wrote %d %s to STRDS <%s> (sources used: %s)"
+            % (
+                len(raster_names), "hours" if hourly else "days", strds,
+                ", ".join(sorted(sources_used)),
+            )
         )
 
 

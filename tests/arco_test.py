@@ -323,6 +323,155 @@ def test_fetch_arco_world_month_raises_when_beyond_era5t_coverage(tin, xr, np, t
         tin.fetch_arco_world_month(ds_full, var_info, year, month, days, world_cache_dir)
 
 
+def test_fetch_arco_world_month_hourly_deaccumulates_per_hour(tin, xr, np, tmp_path):
+    """hourly=True must recover the TRUE per-hour increment at every
+    single hour, not just the correct daily sum -- the daily-mode test
+    above (test_fetch_arco_deaccumulates_and_sums_to_daily_total) only
+    proves the sum is right, which a wrong-but-compensating per-hour
+    split could also produce."""
+    year, month, days = 2021, 3, [1, 2, 3]
+    month_start = np.datetime64("2021-03-01")
+    fetch_start = month_start - np.timedelta64(1, "h")
+    month_end_excl = month_start + np.timedelta64(len(days), "D")
+
+    increment = 0.001
+    series = _make_accumulated_series(xr, np, fetch_start, month_end_excl, increment)
+    ds_full = xr.Dataset({"test_accum_var": series})
+    var_info = {"cds_name": "test_accum_var", "accumulated": True}
+    world_cache_dir = str(tmp_path / "world")
+
+    result = tin.fetch_arco_world_month(
+        ds_full, var_info, year, month, days, world_cache_dir, hourly=True
+    )
+    da = xr.open_dataset(result)["test_accum_var"]
+    assert da.sizes["time"] == len(days) * 24
+    np.testing.assert_allclose(da.values, increment, rtol=1e-9)
+    # and the hours for one calendar day must still sum to the same
+    # daily total the non-hourly path independently computes.
+    day1 = da.sel(time=slice(month_start, month_start + np.timedelta64(23, "h")))
+    np.testing.assert_allclose(day1.sum("time").values, 24 * increment, rtol=1e-9)
+    da.close()
+
+
+def test_fetch_arco_world_month_hourly_instantaneous_returns_raw_readings(tin, xr, np, tmp_path):
+    """Non-accumulated fields in hourly mode need no reduction at all --
+    the raw hourly readings ARE the hourly values."""
+    year, month, days = 2021, 3, [1, 2]
+    month_start = np.datetime64("2021-03-01")
+    month_end_excl = month_start + np.timedelta64(len(days), "D")
+    times = np.arange(month_start, month_end_excl, np.timedelta64(1, "h"))
+    hourly_vals = np.array(
+        [t.hour for t in times.astype("datetime64[h]").astype(object)], dtype=np.float64
+    )
+    data = np.broadcast_to(hourly_vals[:, None, None], (len(times), 2, 2)).copy()
+    da_in = xr.DataArray(
+        data, dims=("time", "latitude", "longitude"),
+        coords={
+            "time": times, "latitude": np.array([10.0, 0.0]), "longitude": np.array([0.0, 1.0]),
+        },
+        name="test_inst_var",
+    )
+    ds_full = xr.Dataset({"test_inst_var": da_in})
+    var_info = {"cds_name": "test_inst_var", "accumulated": False, "daily_statistic": "daily_mean"}
+    world_cache_dir = str(tmp_path / "world")
+
+    result = tin.fetch_arco_world_month(
+        ds_full, var_info, year, month, days, world_cache_dir, hourly=True
+    )
+    da_out = xr.open_dataset(result)["test_inst_var"]
+    assert da_out.sizes["time"] == len(days) * 24
+    np.testing.assert_allclose(da_out.values, np.broadcast_to(hourly_vals[:, None, None], data.shape))
+    da_out.close()
+
+
+def test_fetch_arco_world_month_hourly_and_daily_caches_are_distinct(tin, xr, np, tmp_path):
+    """Requesting hourly then daily (or vice versa) for the same
+    (variable, month) must not collide -- each granularity gets its own
+    cache file, and neither silently serves the other's data."""
+    year, month, days = 2021, 3, [1]
+    month_start = np.datetime64("2021-03-01")
+    fetch_start = month_start - np.timedelta64(1, "h")
+    month_end_excl = month_start + np.timedelta64(1, "D")
+    increment = 0.002
+    series = _make_accumulated_series(xr, np, fetch_start, month_end_excl, increment)
+    ds_full = xr.Dataset({"test_accum_var": series})
+    var_info = {"cds_name": "test_accum_var", "accumulated": True}
+    world_cache_dir = str(tmp_path / "world")
+
+    daily_path = tin.fetch_arco_world_month(
+        ds_full, var_info, year, month, days, world_cache_dir, hourly=False
+    )
+    hourly_path = tin.fetch_arco_world_month(
+        ds_full, var_info, year, month, days, world_cache_dir, hourly=True
+    )
+    assert daily_path != hourly_path
+    assert os.path.exists(daily_path) and os.path.exists(hourly_path)
+
+    daily_da = xr.open_dataset(daily_path)["test_accum_var"]
+    hourly_da = xr.open_dataset(hourly_path)["test_accum_var"]
+    assert daily_da.sizes["time"] == 1
+    assert hourly_da.sizes["time"] == 24
+    daily_da.close()
+    hourly_da.close()
+
+
+def test_fetch_month_hourly_plain_era5_fails_loudly(tin, xr, np, tmp_path, monkeypatch):
+    """The plain-ERA5-via-CDS tier (fetch_era5(), a daily-statistics CDS
+    product with no hourly output) must refuse hourly=True loudly rather
+    than silently returning daily data mislabeled as hourly -- both for
+    the plain -c-style tier and for the one-month ARCO-unavailable
+    stopgap that also calls fetch_era5()."""
+    import grass.script as gs
+
+    gs.set_raise_on_error(True)
+    monkeypatch.setattr(
+        tin, "fetch_era5",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch_era5 must not run")),
+    )
+
+    var_info = {"cds_name": "test_var", "accumulated": False, "daily_statistic": "daily_mean"}
+    clients = {
+        "cds": lambda: object(),
+        "arco": lambda: (_ for _ in ()).throw(AssertionError("ARCO must not be tried")),
+    }
+
+    # use_arco=False: the plain -c tier itself has no hourly path.
+    with pytest.raises(Exception):
+        tin.fetch_month(
+            clients, "test_var", var_info, 2021, 3, [1], [10.0, 0.0, 0.0, 1.0],
+            str(tmp_path), True, False, str(tmp_path / "world"), hourly=True,
+        )
+
+
+def test_fetch_month_hourly_arco_gap_cds_fails_loudly(tin, xr, np, tmp_path, monkeypatch):
+    """Same as above, but via the ARCO-unavailable one-month CDS stopgap
+    path specifically (use_arco=True, ARCO raises ArcoDataUnavailable)."""
+    import grass.script as gs
+
+    gs.set_raise_on_error(True)
+    monkeypatch.setattr(
+        tin, "fetch_era5",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch_era5 must not run")),
+    )
+
+    def unavailable_arco():
+        ds = xr.Dataset(
+            {"test_var": xr.DataArray([0.0], dims=("time",), coords={"time": [np.datetime64("2027-01-01")]})}
+        )
+        ds.attrs["valid_time_stop"] = "2026-03-31"
+        ds.attrs["valid_time_stop_era5t"] = "2026-08-17"
+        return ds
+
+    var_info = {"cds_name": "test_var", "accumulated": False, "daily_statistic": "daily_mean"}
+    clients = {"cds": lambda: object(), "arco": unavailable_arco}
+
+    with pytest.raises(Exception):
+        tin.fetch_month(
+            clients, "test_var", var_info, 2027, 1, [1], [10.0, 0.0, 0.0, 1.0],
+            str(tmp_path), True, True, str(tmp_path / "world"), hourly=True,
+        )
+
+
 def test_fetch_month_falls_back_to_cds_and_caches_separately_when_arco_unavailable(
     tin, xr, np, tmp_path, monkeypatch
 ):

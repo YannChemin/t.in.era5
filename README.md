@@ -240,6 +240,7 @@ only the token itself is account-specific).
 | `arco_world_cache` | Directory for the permanent, area-independent full-world ARCO-ERA5 monthly cache; default `$HOME/RSDATA/ERA5World` (see ARCO-ERA5 section above) |
 | `-e` | Force plain ERA5 (skip ERA5-Land) for every variable/month |
 | `-c` | Use the CDS API instead of ARCO-ERA5 (Google Cloud) for the plain-ERA5 tier |
+| `-h` | Hourly output instead of daily -- one raster per hour, ~24x more STRDS maps for the same period. Supported by ERA5-Land and ARCO-ERA5 (correctly de-accumulated, not just relabeled daily totals); the plain-ERA5-via-CDS tier does not support it yet and fails loudly rather than silently returning daily data -- see "Known gaps" in t.in.era5.md |
 
 ## Requirements
 

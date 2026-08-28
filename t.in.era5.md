@@ -10,7 +10,7 @@ variable.
 
 **t.in.era5**\
 **t.in.era5 --help**\
-**t.in.era5** [**-e**] [**-c**] **variables**=*string*[,*string*,...]
+**t.in.era5** [**-e**] [**-c**] [**-h**] **variables**=*string*[,*string*,...]
 **start**=*string* **end**=*string* [**area**=*north,west,south,east*]
 **output_prefix**=*string* [**cache_dir**=*name*]
 [**arco_world_cache**=*name*]
@@ -26,6 +26,12 @@ entirely).
 plain-ERA5 tier. Requires a working `~/.cdsapirc` for that tier too. By
 default that tier reads the public, no-login ARCO-ERA5 Zarr archive
 instead.
+
+**-h**
+&nbsp;&nbsp;&nbsp;&nbsp;Hourly output instead of daily -- one raster per hour
+(~24x more STRDS maps for the same period; see
+[HOURLY OUTPUT](#hourly-output--h) below for per-source-tier support,
+data volume, and a known gap for the plain-ERA5-via-CDS tier).
 
 ## DESCRIPTION
 
@@ -209,6 +215,79 @@ caches accordingly:
   reused as a substitute once ARCO does ingest that month -- a later
   run will fetch and cache the real ARCO version normally.
 
+## HOURLY OUTPUT (-h)
+
+By default *t.in.era5* reduces everything to one raster per day. Pass
+**-h** to instead get one raster per HOUR -- the raw temporal
+resolution ERA5(-Land) is actually observed/forecast at, before any
+daily reduction. This roughly **multiplies the number of STRDS maps by
+24** for the same date range: budget cache disk space, `t.register`
+time, and downstream processing accordingly. A 3-month hourly pull is
+already ~2160 maps per variable, versus ~90 for the same period daily.
+
+Accumulated fields (`precipitation`, `potential_evaporation`,
+`solar_radiation`, `snowfall`) are correctly **de-accumulated** to
+genuine per-hour amounts, not just relabeled daily totals split evenly
+-- ECMWF's raw archive stores these as running totals since a periodic
+reset, not as hourly increments, so getting this right means
+differencing consecutive raw readings and special-casing the reset
+hour itself (which is already a genuine 1-hour amount, not a diff).
+Two DIFFERENT reset schedules are involved, handled separately and
+correctly for each source:
+
+- **ERA5-Land** (`reanalysis-era5-land`, already used by the daily path
+  for accumulated variables too): a single reset per calendar day, at
+  01 UTC.
+- **ARCO-ERA5** (and plain-ERA5's own raw hourly CDS product): two 12h
+  forecast cycles per day, based at 06 and 18 UTC (first genuine,
+  non-diffed hour at 07 and 19 UTC respectively).
+
+### Per-source-tier support
+
+| tier | hourly output | notes |
+|---|---|---|
+| ERA5-Land (default, tried first) | **yes** | via the same raw-hourly `reanalysis-era5-land` product the daily path already uses for accumulated variables -- in `-h` mode it's used for ALL variables, not just accumulated ones |
+| ARCO-ERA5 (default fallback tier) | **yes** | genuinely hour-native at the Zarr store level; see [ARCO-ERA5 SOURCE](#arco-era5-google-cloud-source) above |
+| plain ERA5 via CDS (**-c** fallback tier, and the one-month ARCO-unavailable stopgap) | **no -- fails loudly** | see [KNOWN GAPS](#known-gaps--future-work) below |
+
+If a run needs `-h` and touches a month/variable that can only be
+served by the plain-ERA5-via-CDS tier, *t.in.era5* aborts with a clear
+error rather than silently returning daily data mislabeled as hourly.
+Ensure ERA5-Land or ARCO-ERA5 coverage is available for the requested
+period, or wait for the gap below to be closed.
+
+## KNOWN GAPS / FUTURE WORK
+
+**Plain-ERA5 (non-ERA5-Land) hourly output via CDS is not yet
+implemented.** The `derived-era5-single-levels-daily-statistics`
+product used by the existing `fetch_era5()` function computes its
+daily reduction *server-side* -- there is no hourly data to recover
+from it locally, unlike the accumulated-field case where the reduction
+happens in this module's own code. This tier is used both when **-c**
+is passed (CDS instead of ARCO-ERA5 for the fallback tier) and as a
+one-month stopgap when ARCO-ERA5 hasn't ingested a given month yet.
+
+A real fix needs a **new fetch function against CDS's raw
+`reanalysis-era5-single-levels` product**, mirroring
+`fetch_era5land_raw_hourly()`'s existing pattern (same request shape:
+`"time": ["%02d:00" % h for h in range(24)]` instead of a
+`daily_statistic`) but for the non-land dataset, plus wiring it into
+`fetch_month()`'s `-c`/gap-fill branches the same way
+`fetch_era5land_raw_hourly()` is already wired into the ERA5-Land
+branch. The de-accumulation math for accumulated fields from that
+product would follow ARCO-ERA5's schedule (`ECMWF_CYCLE_RESET_HOURS =
+{7, 19}` in *t.in.era5.py*), since plain ERA5's raw archive uses the
+same forecast-cycle convention ARCO-ERA5 mirrors -- the
+`_deaccumulate_hourly()` helper already added for `-h` support is
+directly reusable for this, no new de-accumulation logic needed, only
+a new fetch function and its wiring.
+
+Until this is implemented, `-h` requires ERA5-Land or ARCO-ERA5
+coverage for the requested period (see the support table above) --
+`fetch_month()` fails loudly (`_fatal_no_hourly_plain_era5()`) rather
+than silently downgrading to daily output if the plain-ERA5-via-CDS
+tier is reached under `-h`.
+
 ## VARIABLES
 
 | key | CDS variable | native units | converted to |
@@ -260,6 +339,17 @@ t.in.era5 variables=precipitation,temperature,potential_evaporation \
 
 r.hydro.hbv.forcing strds=karkheh_precipitation basins=basins \
   basins_vector=basins_v output_table=karkheh_precip_table
+```
+
+Hourly output for a distributed hydrology model needing sub-daily
+forcing (e.g. *r.hydro.rri*, not a per-basin-lumped model like
+*r.hydro.hbv*):
+
+```sh
+t.in.era5 -h variables=precipitation start=2001-06-01 end=2001-06-07 \
+  output_prefix=karkheh_hourly cache_dir=$HOME/era5_cache
+# -> karkheh_hourly_precipitation, one raster per hour (168 maps for
+#    this 7-day window instead of 7)
 ```
 
 ## SEE ALSO
